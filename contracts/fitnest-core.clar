@@ -119,11 +119,18 @@
 ;; Private Functions
 ;; ======================
 
+(define-private (min (a uint) (b uint))
+  (if (< a b)
+    a
+    b
+  )
+)
+
 ;; Initialize a new user profile if it doesn't exist
 (define-private (initialize-user (user principal))
-  (if (default-to true (map-get? user-profiles user))
-    true
-    (begin
+  (if (is-some (map-get? user-profiles user))
+    true ;; User already exists, do nothing
+    (begin ;; User doesn't exist, initialize
       (map-set user-profiles user {
         total-workouts: u0,
         current-streak: u0,
@@ -134,7 +141,7 @@
       })
       (map-set token-balances user u0)
       (map-set user-workout-counter user u1)
-      true
+      true ;; Return true after initialization
     )
   )
 )
@@ -171,7 +178,7 @@
 ;; Update user streak based on last workout time
 (define-private (update-streak (user principal))
   (let (
-    (user-profile (unwrap! (map-get? user-profiles user) (err "User not found")))
+    (user-profile (unwrap! (map-get? user-profiles user) ERR-USER-NOT-FOUND))
     (current-time block-height)
     (last-workout (get last-workout-time user-profile))
     (current-streak (get current-streak user-profile))
@@ -184,7 +191,7 @@
                  u0))
                  
     ;; Determine new streak value
-    (new-streak (if (or (= last-workout u0) (> time-diff (* u2 one-day-blocks)))
+    (new-streak (if (or (is-eq last-workout u0) (> time-diff (* u2 one-day-blocks)))
                   ;; First workout or more than 2 days passed - reset streak to 1
                   u1
                   ;; Check if this is a new day's workout (between 20-28 hours)
@@ -198,30 +205,48 @@
                    new-streak
                    longest-streak))
   )
-    ;; Return the updated streak values
-    {current-streak: new-streak, longest-streak: new-longest}
+    ;; Return the updated streak values wrapped in ok
+    (ok {current-streak: new-streak, longest-streak: new-longest})
   )
 )
 
 ;; Check if user has reached a milestone
 (define-private (check-milestone (user principal))
   (let (
-    (user-profile (unwrap! (map-get? user-profiles user) (err "User not found")))
+    (user-profile (unwrap! (map-get? user-profiles user) ERR-USER-NOT-FOUND))
     (workout-count (get total-workouts user-profile))
   )
-    (filter check-unclaimed-milestone MILESTONE-LEVELS)
+    (ok (filter check-unclaimed-milestone MILESTONE-LEVELS))
   )
 )
 
 ;; Helper for milestone checking
 (define-private (check-unclaimed-milestone (milestone {count: uint, reward: uint}))
-  (let (
-    (user-profile (unwrap! (map-get? user-profiles tx-sender) (err "User not found")))
-    (workout-count (get total-workouts user-profile))
-    (milestone-count (get count milestone))
-    (milestone-claimed (default-to false (map-get? claimed-milestones {user: tx-sender, milestone-level: milestone-count})))
+  (match (map-get? user-profiles tx-sender)
+    ;; If user profile exists, perform the check
+    user-profile 
+      (let (
+        (workout-count (get total-workouts user-profile))
+        (milestone-count (get count milestone))
+        (milestone-claimed (default-to false (map-get? claimed-milestones {user: tx-sender, milestone-level: milestone-count})))
+      )
+        (and (>= workout-count milestone-count) (not milestone-claimed))
+      )
+    ;; If user profile doesn't exist, they can't have claimed the milestone
+    false
   )
-    (and (>= workout-count milestone-count) (not milestone-claimed))
+)
+
+;; Fold helper to find the reward for a specific milestone level during fold
+(define-private (find-milestone-reward-fold 
+    (milestone {count: uint, reward: uint}) 
+    (accumulator {target-level: uint, current-found: uint})
+  )
+  (if (is-eq (get count milestone) (get target-level accumulator))
+      ;; If count matches target level, update current-found with the reward
+      (merge accumulator {current-found: (get reward milestone)})
+      ;; Otherwise, return the accumulator unchanged
+      accumulator
   )
 )
 
@@ -336,7 +361,7 @@
     (verifier tx-sender)
     (workout (unwrap! (map-get? workout-history {user: user, workout-id: workout-id}) ERR-USER-NOT-FOUND))
     (user-profile (unwrap! (map-get? user-profiles user) ERR-USER-NOT-FOUND))
-    (streak-info (update-streak user))
+    (streak-info (try! (update-streak user)))
     (verified (get verified workout))
   )
     ;; Check authorization
@@ -378,45 +403,6 @@
       
       ;; Update challenge progress if user is in any active challenges
       (ok rewards)
-    )
-  )
-)
-
-;; Claim milestone rewards
-(define-public (claim-milestone (milestone-level uint))
-  (let (
-    (user tx-sender)
-    (user-profile (unwrap! (map-get? user-profiles user) ERR-USER-NOT-FOUND))
-    (total-workouts (get total-workouts user-profile))
-    (milestone-claimed (default-to false (map-get? claimed-milestones {user: user, milestone-level: milestone-level})))
-    
-    ;; Find the corresponding milestone from our list
-    (milestone-info (unwrap! 
-      (filter milestone-matches-level MILESTONE-LEVELS) 
-      ERR-USER-NOT-FOUND))
-    
-    (milestone-reward (get reward milestone-info))
-  )
-    ;; Validate milestone eligibility
-    (asserts! (>= total-workouts milestone-level) ERR-USER-NOT-FOUND)
-    (asserts! (not milestone-claimed) ERR-MILESTONE-ALREADY-CLAIMED)
-    
-    ;; Mark milestone as claimed
-    (map-set claimed-milestones {user: user, milestone-level: milestone-level} true)
-    
-    ;; Mint reward tokens
-    (mint-tokens user milestone-reward)
-    
-    (ok milestone-reward)
-  )
-)
-
-;; Helper for matching milestone level
-(define-private (milestone-matches-level (milestone {count: uint, reward: uint}))
-  (let ((level (get count milestone)))
-    (if (is-eq level milestone-level)
-      (some milestone)
-      none
     )
   )
 )
@@ -463,8 +449,9 @@
     (current-time block-height)
     (start-time (get start-time challenge))
     (end-time (get end-time challenge))
-    (already-joined (default-to false 
-                     (map-has-key? challenge-participants {challenge-id: challenge-id, user: user})))
+    ;; Check if the user participation record exists
+    (already-joined (is-some 
+                     (map-get? challenge-participants {challenge-id: challenge-id, user: user})))
   )
     ;; Validate conditions
     (asserts! is-active ERR-CHALLENGE-NOT-ACTIVE)
